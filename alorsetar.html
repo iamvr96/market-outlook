@@ -144,6 +144,8 @@
   .choice input:checked+label{border-color:var(--gold);background:linear-gradient(180deg,rgba(201,168,106,.12),rgba(201,168,106,.02));box-shadow:inset 0 0 0 1px rgba(201,168,106,.25)}
   .choice input:focus-visible+label{outline:1px solid var(--gold-hi);outline-offset:4px}
 
+  .full-note{display:none;margin-top:12px;text-align:center;font-size:13px;color:var(--gold-hi)}
+  .choice.full label{opacity:.35;cursor:not-allowed;pointer-events:none}
   .attend{display:grid;grid-template-columns:1fr 1fr;gap:14px}
   .attend label{padding:22px 16px;text-align:center}
   .attend label b{display:block;font-family:var(--serif);font-weight:400;font-style:italic;font-size:24px;color:#fff}
@@ -267,6 +269,7 @@
             <div class="choice"><input type="radio" id="att-no" name="attendance" value="Not Attending"><label for="att-no"><b>Decline</b><span>I am unable to attend</span></label></div>
           </div>
           <p class="err">Kindly indicate your attendance.</p>
+          <p class="full-note" id="fullNote">Sorry, this event is full. Please contact your Personal Relationship Banker or Branch Manager.</p>
         </div>
 
         <div class="row-title">
@@ -340,7 +343,7 @@
 <script type="module">
 /* Firebase loads in the background, so the invitation still opens even if
    config.js or the internet connection is missing (e.g. in a file preview). */
-let fb = null;   // { db, doc, setDoc, serverTimestamp } once connected
+let fb = null;   // Firestore helpers once connected
 (async () => {
   try {
     const SDK = "https://www.gstatic.com/firebasejs/10.12.2/";
@@ -349,9 +352,30 @@ let fb = null;   // { db, doc, setDoc, serverTimestamp } once connected
     ]);
     if (!cfg.isConfigured()) { console.warn("Fill in config.js to enable RSVPs"); return; }
     const db = store.getFirestore(app.initializeApp(cfg.firebaseConfig));
-    fb = { db, doc: store.doc, setDoc: store.setDoc, serverTimestamp: store.serverTimestamp };
+    fb = { db, doc: store.doc, setDoc: store.setDoc, getDoc: store.getDoc, writeBatch: store.writeBatch,
+           increment: store.increment, serverTimestamp: store.serverTimestamp };
+    checkSeats();
   } catch (err) { console.warn("Firebase not loaded:", err); }
 })();
+
+/* ---------- Seat limit (50 per venue) ----------
+   Firebase keeps a seat counter per event (collection "counts"). Each acceptance takes one seat in the
+   same save, and Firebase refuses it once the venue is full. Declines are always accepted. */
+let isFull = false;
+async function seatInfo(){
+  try { const s = await fb.getDoc(fb.doc(fb.db, 'counts', CONFIG.EVENT_ID)); return s.exists() ? s.data() : null; }
+  catch (e) { return null; }
+}
+async function checkSeats(){
+  const c = await seatInfo();
+  isFull = !!(c && c.capacity && c.attending >= c.capacity);
+  const yes = document.getElementById('att-yes');
+  if (!yes) return;
+  yes.disabled = isFull;
+  yes.closest('.choice').classList.toggle('full', isFull);
+  document.getElementById('fullNote').style.display = isFull ? 'block' : 'none';
+  if (isFull && yes.checked) { yes.checked = false; }
+}
 
 /* ======================= CONFIG – edit these ======================= */
 /* Firebase settings live in config.js */
@@ -451,7 +475,7 @@ form.addEventListener('submit', async e => {
   }
   if (first) { first.scrollIntoView({behavior:'smooth', block:'center'}); return; }
   if (Date.now() > new Date(CONFIG.RSVP_DEADLINE).getTime()) {
-    msg.textContent = 'Responses have now closed. Kindly contact your Relationship Manager.'; return;
+    msg.textContent = 'Sorry, RSVP is now closed. Please contact your Personal Relationship Banker or Branch Manager.'; return;
   }
 
   const going = attending();
@@ -472,8 +496,9 @@ form.addEventListener('submit', async e => {
 
   try {
     if (!fb) { const e = new Error('not connected'); e.code = 'not-connected'; throw e; }
+    // One response per person: same name + same email is blocked; a different name with the same email is fine
     const id = await personId(rsvp.email, rsvp.name);
-    await fb.setDoc(fb.doc(fb.db, 'rsvps', id), {
+    const record = {
       event: CONFIG.EVENT_ID,
       title: rsvp.title,
       name: rsvp.name,
@@ -483,7 +508,16 @@ form.addEventListener('submit', async e => {
       attendance: rsvp.attendance,
       source: 'web',
       createdAt: fb.serverTimestamp()
-    });
+    };
+    const ref = fb.doc(fb.db, 'rsvps', id);
+    if (going) {   // acceptance: save the RSVP and take one seat together (refused by Firebase if the venue is full)
+      const b = fb.writeBatch(fb.db);
+      b.set(ref, record);
+      b.update(fb.doc(fb.db, 'counts', CONFIG.EVENT_ID), { attending: fb.increment(1), lastId: id });
+      await b.commit();
+    } else {
+      await fb.setDoc(ref, record);
+    }
 
     if (useMail) {
       // Email alert is a nice-to-have; never block the guest on it
@@ -502,8 +536,12 @@ form.addEventListener('submit', async e => {
     showSuccess(rsvp, going);
   } catch (err) {
     console.error(err);
-    msg.textContent = err.code === 'permission-denied'
-      ? 'We already have a response under this name and email address. Kindly contact your Relationship Manager for any changes.'
+    let full = false;
+    if (err.code === 'permission-denied' && going) { await checkSeats(); full = isFull; }
+    msg.textContent = full
+      ? 'Sorry, this event is full. Please contact your Personal Relationship Banker or Branch Manager.'
+      : err.code === 'permission-denied'
+      ? 'You have already replied with this name and email. To make changes, please contact your Personal Relationship Banker or Branch Manager.'
       : err.code === 'not-connected'
       ? 'RSVP is not connected yet (preview mode). It works once published with config.js filled in.'
       : 'We were unable to record your response. Kindly try again in a moment.';
@@ -512,7 +550,8 @@ form.addEventListener('submit', async e => {
   }
 });
 
-// One response per person: the record ID is a hash of email + name, so a couple can share an email
+
+// Record ID = hash of event + email + name, so the same person can only respond once per event
 async function personId(email, name){
   const key = CONFIG.EVENT_ID + '|' + String(email).trim().toLowerCase() + '|' + String(name).trim().toLowerCase().replace(/\s+/g, ' ');
   const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(key));

@@ -519,18 +519,22 @@ const MEALS = ["12-Hour Slow-Braised Beef Cheek", "Fillet of Seabass", "Chicken 
 /* ================= Events =================
    Each event has its own invitation page; every RSVP carries an "event" field.
    To add Penang later: add an entry here, a page like alorsetar.html, and a matching rule in firestore.rules. */
-const gridTables = (cols, rows, seats) => {   // placeholder layout until the hotel floor plan is confirmed
+const gridTables = (cols, rows, seats, count) => {   // placeholder layout until the hotel floor plan is confirmed
   const xs = cols === 3 ? [170, 290, 410] : Array.from({ length: cols }, (_, i) => 150 + i * (300 / (cols - 1)));
-  const ys = Array.from({ length: rows }, (_, i) => 110 + i * (300 / Math.max(1, rows - 1)));
+  const ys = Array.from({ length: rows }, (_, i) => (rows > 3 ? 72 : 110) + i * ((rows > 3 ? 350 : 300) / Math.max(1, rows - 1)));
   const out = []; let n = 1;
   ys.forEach(y => xs.forEach(x => { out.push({ id: String(n), label: 'Table ' + n, short: String(n), seats, x, y }); n++; }));
-  return out;
+  return count ? out.slice(0, count) : out;
 };
 const EVENTS = {
   alorsetar: { id: 'alorsetar', label: 'Alor Setar', date: '18 Nov 2026', dateLong: 'Wednesday 18 November 2026',
-    venue: 'Grand Alora Hotel, Alor Setar', room: 'Grand Alora Hotel', layout: 'grid', meals: false,
+    venue: 'Grand Alora Hotel, Alor Setar', room: 'Grand Alora Hotel', layout: 'grid', meals: false, capacity: 50,
     branches: ['Alor Setar', 'Sungai Petani', 'Kangar'],
-    tables: gridTables(3, 3, 5) }
+    tables: gridTables(3, 4, 5, 10) },          // 10 tables x 5 seats = 50 (placeholder until the hotel plan)
+  penang: { id: 'penang', label: 'Penang', date: '19 Nov 2026', dateLong: 'Thursday 19 November 2026',
+    venue: 'Courtyard by Marriott Penang', room: 'Courtyard by Marriott Penang', layout: 'grid', meals: false, capacity: 50,
+    branches: ['Bayan Baru', 'Pulau Penang', 'Seberang Jaya'],
+    tables: gridTables(3, 4, 5, 10) }           // 10 tables x 5 seats = 50 (placeholder until the hotel plan)
 };
 let EV = EVENTS.alorsetar;
 try { const s = localStorage.getItem('mot-admin-event'); if (s && EVENTS[s]) EV = EVENTS[s]; } catch (e) {}
@@ -610,6 +614,7 @@ function listen(){
     if (typeof refreshEvSel === 'function') refreshEvSel();
     $('#liveDot').style.opacity = 1;
     renderAll();
+    syncSeatsSoon();
   }, err => { console.error(err); $('#liveDot').style.opacity = .3; toast('Could not load the guest list: ' + err.code, true); });
 }
 
@@ -638,6 +643,32 @@ const dupKey = r => evOf(r) + '|' + String(r.email || '').trim().toLowerCase() +
 const isDup = r => rows.filter(x => dupKey(x) === dupKey(r)).length > 1;
 const badName = n => !/[a-z]/i.test(String(n || '')) || /\d{5,}/.test(String(n || '').replace(/[\s-]/g, ''));
 const titleHtml = (t, n) => (t ? `<span class="ttl">${esc(t)}</span> ` : '') + esc(n);
+
+/* ---------- Seat counters (hard limit per venue) ----------
+   Firebase refuses guest acceptances once counts/{event}.attending reaches capacity.
+   This page creates the counters and keeps them equal to the real number of attending guests,
+   so seats freed by deleting a guest or changing them to "Not Attending" reopen automatically. */
+const seatDocs = {};
+let seatSyncTimer = null, seatsWatched = false;
+function watchSeats(){
+  if (seatsWatched) return; seatsWatched = true;
+  Object.values(EVENTS).forEach(e => {
+    if (!e.capacity) return;
+    onSnapshot(doc(db, 'counts', e.id), s => { seatDocs[e.id] = s.exists() ? s.data() : null; syncSeatsSoon(); },
+      err => console.warn('Seat counter', e.id, err.code));
+  });
+}
+function syncSeatsSoon(){ watchSeats(); clearTimeout(seatSyncTimer); seatSyncTimer = setTimeout(syncSeats, 2500); }
+async function syncSeats(){
+  for (const e of Object.values(EVENTS)) {
+    if (!e.capacity) continue;
+    const actual = allRows.filter(r => evOf(r) === e.id && r.attendance === 'Attending').length;
+    const cur = seatDocs[e.id];
+    if (cur && cur.attending === actual && cur.capacity === e.capacity) continue;
+    try { await setDoc(doc(db, 'counts', e.id), { attending: actual, capacity: e.capacity, lastId: cur?.lastId || '' }, { merge: true }); }
+    catch (err) { console.warn('Could not update seat counter', e.id, err.code); }
+  }
+}
 
 const tsMs = t => t?.toMillis ? t.toMillis() : 0;
 const fmt = t => t?.toDate ? t.toDate().toLocaleString('en-GB', {timeZone:'Asia/Kuala_Lumpur', day:'2-digit', month:'short', hour:'2-digit', minute:'2-digit'}) : '—';
@@ -686,8 +717,11 @@ function render(){
   const plusOnes = linkedYes + yes.filter(r => r.plus_one).length;
   const totalPax = yes.reduce((n, r) => n + pax(r), 0);
   $('#sTotal').textContent = rows.length;
-  $('#sYes').textContent = totalPax;
-  $('#sYesSub').textContent = `${totalPax - plusOnes} main guests · ${plusOnes} plus-one${plusOnes === 1 ? '' : 's'}`;
+  $('#sYes').textContent = EV.capacity ? `${totalPax}/${EV.capacity}` : totalPax;
+  $('#sYesSub').textContent = EV.capacity
+    ? (totalPax > EV.capacity ? `⚠ Over capacity by ${totalPax - EV.capacity}` : `${EV.capacity - totalPax} seats left`)
+    : `${totalPax - plusOnes} main guests · ${plusOnes} plus-one${plusOnes === 1 ? '' : 's'}`;
+  $('#sYesSub').style.color = EV.capacity && totalPax > EV.capacity ? 'var(--no)' : '';
   $('#sNo').textContent = rows.length - yes.length;
   $('#sIn').textContent = `${yes.filter(r => r.checkedIn).reduce((n, r) => n + pax(r), 0)}/${totalPax}`;
   bars($('#byBranch'), BRANCHES, BRANCHES.map(b => yes.filter(r => r.branch === b).reduce((n, r) => n + pax(r), 0)));
