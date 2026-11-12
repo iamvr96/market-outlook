@@ -172,6 +172,13 @@
   /* ---------- Seating ---------- */
   .seat-grid{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(300px,1fr);gap:18px;align-items:start}
   .plan-wrap{position:relative;padding:14px;border:1px solid var(--line-soft);background:var(--panel)}
+  .plan.tall{max-height:74vh}
+  @media (min-width:981px){ .seat-grid.wide{grid-template-columns:minmax(0,2.3fr) minmax(290px,1fr)} }
+  .plan-wrap{overflow-x:auto}
+  .plan-wrap .swipe{display:none;font-size:11px;color:var(--muted);margin:2px 0 6px}
+  @media (max-width:640px){ .plan.wide{min-width:600px} .plan-wrap.wide .swipe{display:block} }
+  .renum{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:2px 0 12px;padding:10px;border:1px solid var(--line-soft)}
+  .renum .in{width:90px;margin:0}
   .plan{width:100%;height:auto;display:block;touch-action:manipulation;user-select:none}
   .plan .wall{fill:none;stroke:rgba(233,236,245,.55);stroke-width:2}
   .plan .divider{stroke:rgba(233,236,245,.25);stroke-width:1;stroke-dasharray:8 4 2 4}
@@ -383,6 +390,7 @@
     <div class="seat-grid">
       <div>
         <div class="plan-wrap">
+          <p class="swipe" id="planSwipe">Swipe sideways to see the whole room →</p>
           <svg class="plan" id="plan" viewBox="-24 -26 542 612" role="img" aria-label="Floor plan"></svg>
           <div class="legend"><span><i></i>Empty seat</span><span><i class="t"></i>Seated</span><span><i class="h"></i>Arrived</span><span class="mini">Tap a table to see who is seated there.</span></div>
         </div>
@@ -534,9 +542,11 @@ const EVENTS = {
     tables: [[296,114],[373,257],[512,114],[598,255],[724,120]].map(([x, y], i) =>
       ({ id: String(i + 1), label: 'Table ' + (i + 1), short: String(i + 1), seats: 10, around: true, x, y })) },
   penang: { id: 'penang', label: 'Penang', date: '19 Nov 2026', dateLong: 'Thursday 19 November 2026',
-    venue: 'Courtyard by Marriott Penang', room: 'Courtyard by Marriott Penang', layout: 'grid', meals: false, capacity: 50,
+    venue: 'Courtyard by Marriott Penang', room: 'Courtyard by Marriott Penang', layout: 'courtyard', meals: false, capacity: 50,
     branches: ['Bayan Baru', 'Pulau Penang', 'Seberang Jaya'],
-    tables: gridTables(3, 4, 5, 10) }           // 10 tables x 5 seats = 50 (placeholder until the hotel plan)
+    // Hotel floor plan: 5 round tables x 10 seats = 50. Table 1 = front middle; 2 & 3 front left/right; 4 & 5 back left/right. AV console not included.
+    tables: [[240,263],[128,263],[353,263],[185,395],[297,395]].map(([x, y], i) =>
+      ({ id: String(i + 1), label: 'Table ' + (i + 1), short: String(i + 1), seats: 10, around: true, x, y })) }
 };
 let EV = EVENTS.alorsetar;
 try { const s = localStorage.getItem('mot-admin-event'); if (s && EVENTS[s]) EV = EVENTS[s]; } catch (e) {}
@@ -656,9 +666,42 @@ function watchSeats(){
   if (seatsWatched) return; seatsWatched = true;
   Object.values(EVENTS).forEach(e => {
     if (!e.capacity) return;
-    onSnapshot(doc(db, 'counts', e.id), s => { seatDocs[e.id] = s.exists() ? s.data() : null; syncSeatsSoon(); },
+    onSnapshot(doc(db, 'counts', e.id), s => { seatDocs[e.id] = s.exists() ? s.data() : null; applyLabels(e); syncSeatsSoon(); },
       err => console.warn('Seat counter', e.id, err.code));
   });
+}
+/* Table numbers can be changed on the admin page. The table's ID stays the same, so seating is never lost. */
+function applyLabels(e){
+  const L = (seatDocs[e.id] && seatDocs[e.id].labels) || {};
+  const before = e.tables.map(t => t.short).join('|');
+  e.tables.forEach(t => { const n = String(L[t.id] || t.id); t.short = n; t.label = 'Table ' + n; });
+  if (e === EV && before !== e.tables.map(t => t.short).join('|')) refreshTableOptions();
+}
+function refreshTableOptions(){
+  const keep = [$('#fTable').value, $('#ciTblFilter').value];
+  const tOpts = `<option value="">All tables</option>` + TABLES.map(t => `<option value="${t.id}">${esc(t.label)}</option>`).join('') + `<option value="none">No table</option>`;
+  $('#fTable').innerHTML = tOpts; $('#ciTblFilter').innerHTML = tOpts;
+  $('#fTable').value = keep[0]; $('#ciTblFilter').value = keep[1];
+  renderAll();
+}
+let renaming = false;
+async function saveTableNumber(t, raw){
+  const v = String(raw || '').trim().replace(/^table\s*/i, '');
+  if (!/^[A-Za-z0-9][A-Za-z0-9 \-]{0,5}$/.test(v)) { toast('Use a short number or name, e.g. 8 or VIP', true); return false; }
+  const labels = {};
+  const other = TABLES.find(x => x !== t && x.short.toLowerCase() === v.toLowerCase());
+  if (other) {
+    if (!confirm(`${other.label} already has that number.\nSwap the numbers of ${t.label} and ${other.label}?`)) return false;
+    labels[other.id] = t.short;
+  }
+  labels[t.id] = v;
+  try { await setDoc(doc(db, 'counts', EV.id), { labels }, { merge: true }); toast(other ? `Swapped · now Table ${v} and Table ${t.short}` : `Now Table ${v}`); return true; }
+  catch (e) { console.error(e); toast('Could not save the table number', true); return false; }
+}
+async function resetTableNumbers(){
+  if (!confirm(`Put all ${EV.label} tables back to their original numbers?`)) return;
+  try { await setDoc(doc(db, 'counts', EV.id), { labels: Object.fromEntries(TABLES.map(t => [t.id, t.id])) }, { merge: true }); toast('Table numbers reset'); }
+  catch (e) { console.error(e); toast('Could not reset the table numbers', true); }
 }
 function syncSeatsSoon(){ watchSeats(); clearTimeout(seatSyncTimer); seatSyncTimer = setTimeout(syncSeats, 2500); }
 async function syncSeats(){
@@ -948,21 +991,38 @@ function chairs(t){
     return { x: t.x + Math.cos(deg * Math.PI / 180) * R, y: t.y + Math.sin(deg * Math.PI / 180) * R, a: deg + 90 }; });
 }
 const ALORA = `
-    <text x="470" y="-30" text-anchor="middle" style="fill:var(--gold-hi);font:400 17px var(--serif)">Halia Hall · Level 2 · Grand Alora Hotel</text>
-    <path class="wall" d="M0 0 V335 H940 M0 0 H56 M163 0 H940"/>
-    <line class="divider" x1="940" y1="0" x2="940" y2="335"/>
+    <text x="415" y="-28" text-anchor="middle" style="fill:var(--gold-hi);font:400 17px var(--serif)">Halia Hall · Level 2 · Grand Alora Hotel</text>
+    <path class="wall" d="M0 0 V335 H830 M0 0 H56 M163 0 H830"/>
+    <line class="divider" x1="830" y1="0" x2="830" y2="335"/>
     <path class="wall" style="stroke-width:1" d="M56 0 A52 52 0 0 0 108 52 M163 0 A52 52 0 0 1 111 52"/>
     <text class="lbl" x="110" y="-8" text-anchor="middle">Entrance</text>
-    <rect class="fixture" x="215" y="6" width="455" height="18"/><rect class="fixture" x="719" y="6" width="165" height="18"/>
+    <rect class="fixture" x="215" y="6" width="455" height="18"/><rect class="fixture" x="719" y="6" width="111" height="18"/>
     <rect class="fixture" x="0" y="-3" width="48" height="50"/><rect class="fixture" x="166" y="-3" width="49" height="50"/>
-    <rect class="fixture" x="670" y="-3" width="49" height="50"/><rect class="fixture" x="884" y="-3" width="48" height="50"/>
+    <rect class="fixture" x="670" y="-3" width="49" height="50"/>
     <rect class="fixture" x="0" y="309" width="25" height="26"/><rect class="fixture" x="188" y="309" width="27" height="26"/>
-    <rect class="fixture" x="667" y="309" width="29" height="26"/><rect class="fixture" x="880" y="309" width="52" height="26"/>
+    <rect class="fixture" x="667" y="309" width="29" height="26"/>
     <rect class="screen" x="8" y="92" width="10" height="160"/>
     <text class="lbl" transform="translate(34 172) rotate(90)" text-anchor="middle">Screen</text>`;
+const COURTYARD = `
+    <text x="238" y="-22" text-anchor="middle" style="fill:var(--gold-hi);font:400 17px var(--serif)">Courtyard by Marriott Penang</text>
+    <path class="wall" d="M0 0 H477 V266 H430 V326 H477 V660 H0 V326 H68 V266 H0 Z"/>
+    <rect class="screen" x="138" y="3" width="190" height="8"/>
+    <text class="lbl" x="233" y="30" text-anchor="middle">LED Screen</text>
+    <path class="wall" style="stroke-width:1" d="M0 43 H-28 A30 30 0 0 1 0 73"/>
+    <path class="wall" style="stroke-width:1" d="M0 213 H-28 A30 30 0 0 1 0 243"/>
+    <path class="wall" style="stroke-width:1" d="M0 338 H-28 A30 30 0 0 1 0 368"/>
+    <path class="wall" style="stroke-width:1" d="M0 513 H-28 A30 30 0 0 1 0 543"/>
+    <path class="wall" style="stroke-width:1" d="M50 0 V30 A30 30 0 0 0 80 0"/>
+    <path class="wall" style="stroke-width:1" d="M365 0 V-33 A33 33 0 0 1 398 0"/>
+    <rect class="fixture" x="190" y="561" width="37" height="55"/>
+    <rect class="fixture" x="467" y="561" width="10" height="87"/>`;
 function drawPlan(){
-  $('#plan').setAttribute('viewBox', EV.layout === 'alora' ? '-30 -52 1000 412' : '-24 -26 542 612');
-  const fixed = EV.layout === 'alora' ? ALORA : EV.layout !== 'jb' ? `
+  $('#plan').classList.toggle('tall', EV.layout === 'courtyard');
+  $('#plan').classList.toggle('wide', EV.layout === 'alora');
+  $('.seat-grid').classList.toggle('wide', EV.layout === 'alora');
+  $('.plan-wrap').classList.toggle('wide', EV.layout === 'alora');
+  $('#plan').setAttribute('viewBox', EV.layout === 'alora' ? '-16 -48 862 400' : EV.layout === 'courtyard' ? '-40 -48 550 726' : '-24 -26 542 612');
+  const fixed = EV.layout === 'alora' ? ALORA : EV.layout === 'courtyard' ? COURTYARD : EV.layout !== 'jb' ? `
     <text x="247" y="-10" text-anchor="middle" style="fill:var(--gold-hi);font:400 17px var(--serif)">${esc(EV.room)}</text>
     <path class="wall" d="M0 0 H494 V503 H300 M190 503 H0 Z"/>
     <rect class="screen" x="11" y="148" width="10" height="192"/>
@@ -1025,9 +1085,10 @@ function renderSeating(){
   if (t) {
     const seated = seatedAt(t.id).sort((a, z) => String(a.name).localeCompare(String(z.name)));
     $('#tblTitle').textContent = t.label;
-    $('#tblCount').textContent = `${paxOf(seated)}/${t.seats} seated · ${paxOf(seated.filter(r => r.checkedIn))} arrived`;
+    $('#tblCount').innerHTML = `${paxOf(seated)}/${t.seats} seated · ${paxOf(seated.filter(r => r.checkedIn))} arrived <button class="btn sm" id="tblRename" style="margin-left:8px">${renaming ? 'Close' : 'Change number'}</button>`;
     const tally = MEALS.map(m => [mealShort(m), seated.filter(r => r.main_course === m).length]).filter(x => x[1]);
-    $('#tblBody').innerHTML = (seated.length ? `<div class="glist" style="max-height:none;margin-top:4px">` + seated.map(r => `
+    $('#tblBody').innerHTML = (renaming ? `<div class="renum"><span>New number</span><input class="in" id="tblNo" maxlength="6" value="${esc(t.short)}" aria-label="New table number">
+        <button class="btn sm" id="tblNoSave">Save</button><button class="btn sm" id="tblNoReset" title="Back to the hotel plan numbers">Reset all</button></div>` : '') + (seated.length ? `<div class="glist" style="max-height:none;margin-top:4px">` + seated.map(r => `
       <div class="gi" style="cursor:default">
         <div class="gn">${titleHtml(r.title, r.name)}${isVip(r.title) ? '<span class="vip">VIP</span>' : ''}
           <small>${mealPre(r)}${esc(r.branch)}${mainOf(r) ? ' · plus-one of ' + esc(fullName(mainOf(r).title, mainOf(r).name)) : ''}</small>
@@ -1075,7 +1136,7 @@ async function dropOn(tableId){
 
 $('#plan').addEventListener('click', e => {
   const g = e.target.closest('.tbl'); if (!g) return;
-  if (pick) dropOn(g.dataset.table); else { openTable = g.dataset.table; renderSeating(); }
+  if (pick) dropOn(g.dataset.table); else { if (openTable !== g.dataset.table) renaming = false; openTable = g.dataset.table; renderSeating(); }
 });
 $('#plan').addEventListener('keydown', e => { if ((e.key === 'Enter' || e.key === ' ') && e.target.closest('.tbl')) { e.preventDefault(); e.target.closest('.tbl').dispatchEvent(new MouseEvent('click', { bubbles: true })); } });
 $('#plan').addEventListener('dragover', e => { const g = e.target.closest('.tbl'); if (g) { e.preventDefault(); $$('.tbl.drop').forEach(x => x !== g && x.classList.remove('drop')); g.classList.add('drop'); } });
@@ -1090,7 +1151,15 @@ $('#seatSel').addEventListener('click', e => {
   if (e.target.id === 'pickCancel') { pick = null; renderSeating(); }
   if (e.target.id === 'pickUnseat') dropOn('');
 });
+$('#tblCount').addEventListener('click', e => {
+  if (!e.target.closest('#tblRename')) return;
+  renaming = !renaming; renderSeating();
+  if (renaming) setTimeout(() => { const i = $('#tblNo'); if (i) { i.focus(); i.select(); } }, 0);
+});
+$('#tblBody').addEventListener('keydown', e => { if (e.key === 'Enter' && e.target.id === 'tblNo') $('#tblNoSave').click(); });
 $('#tblBody').addEventListener('click', async e => {
+  if (e.target.closest('#tblNoSave')) { const t = tableById(openTable); if (t && await saveTableNumber(t, $('#tblNo').value)) { renaming = false; renderSeating(); } return; }
+  if (e.target.closest('#tblNoReset')) { await resetTableNumbers(); return; }
   const mv = e.target.closest('[data-move]'), un = e.target.closest('[data-unseat]');
   if (mv) { const r = byId(mv.dataset.move); pick = { ids: [r.id], label: fullName(r.title, r.name) }; renderSeating(); window.scrollTo({ top: 0, behavior: 'smooth' }); }
   if (un) { const r = byId(un.dataset.unseat); if (await assignTable([r.id], '')) toast(`${fullName(r.title, r.name)} removed from ${tableById(openTable)?.label}`); }
@@ -1166,7 +1235,7 @@ function renderCheckin(){
     .sort((a, z) => (TABLES.findIndex(t => t.id === a.table) + 1 || 99) - (TABLES.findIndex(t => t.id === z.table) + 1 || 99) || String(a.name).localeCompare(String(z.name)));
   $('#ciLeftN').textContent = `(${paxOf(pend)})`;
   $('#ciPending').innerHTML = pend.length ? pend.map(r => `<div class="ci-row">
-      <span class="tchip">${r.table ? 'T' + r.table : '—'}</span>
+      <span class="tchip">${r.table ? 'T' + esc(tableShort(r.table) || r.table) : '—'}</span>
       <div>${titleHtml(r.title, r.name)}${isVip(r.title) ? '<span class="vip">VIP</span>' : ''}<small>${mealPre(r)}${esc(r.branch)} · <a href="tel:${esc(r.phone)}" style="color:var(--muted)">${esc(r.phone)}</a></small></div>
       <button class="btn sm" data-in1="${r.id}">Check in</button></div>`).join('')
     : `<p class="mini" style="padding:10px 0">${g.length ? 'Everyone here has arrived. ✨' : 'No attending guests yet.'}</p>`;
@@ -1174,7 +1243,7 @@ function renderCheckin(){
   // recently arrived
   const recent = here.slice().sort((a, z) => tsMs(z.checkedInAt) - tsMs(a.checkedInAt)).slice(0, 8);
   $('#ciRecent').innerHTML = recent.length ? recent.map(r => `<div class="ci-row">
-      <span class="tchip">${r.table ? 'T' + r.table : '—'}</span>
+      <span class="tchip">${r.table ? 'T' + esc(tableShort(r.table) || r.table) : '—'}</span>
       <div>${titleHtml(r.title, r.name)}<small>${hhmm(r.checkedInAt) || 'Just now'}${r.checkedInBy ? ' · by ' + esc(r.checkedInBy.split('@')[0]) : ''}</small></div>
       <button class="btn sm" data-undo="${r.id}">Undo</button></div>`).join('')
     : `<p class="mini" style="padding:10px 0">No arrivals yet.</p>`;
