@@ -132,6 +132,11 @@
   .grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
   .modal .f{margin-bottom:16px}
   .modal textarea{min-height:70px;resize:vertical}
+  .imp-sec{margin:14px 0;padding:12px 14px;border:1px solid var(--line-soft)}
+  .imp-sec b.n{font-size:22px;color:var(--gold-hi);margin-right:8px}
+  .imp-sec details{margin-top:6px;color:var(--muted);font-size:13px}
+  .imp-sec summary{cursor:pointer;color:var(--gold)}
+  .imp-sec ul{margin:6px 0 0 18px}
   .modal .foot{display:flex;gap:10px;justify-content:flex-end;margin-top:8px}
   .chk{display:flex;align-items:center;gap:10px;cursor:pointer;margin:4px 0 18px;font-size:13px}
   .chk input{accent-color:var(--gold);width:16px;height:16px}
@@ -372,6 +377,8 @@
         <option value="name">Name A–Z</option><option value="branch">Branch</option><option value="table">Table</option>
       </select>
       <div class="actions">
+        <button class="btn" id="importBtn" title="Seat guests from an Excel seating list">Import seating</button>
+        <input type="file" id="importFile" accept=".xlsx,.xls" hidden>
         <button class="btn" id="exportBtn">Export to Excel</button>
         <button class="btn primary" id="addBtn">+ Add Guest</button>
       </div>
@@ -490,6 +497,15 @@
     <h2 class="gold-text">Remove guest?</h2>
     <p style="color:var(--muted);line-height:1.7;margin-bottom:24px"><b id="delName" style="color:var(--text)"></b> will be permanently removed from the guest list. This cannot be undone.</p>
     <div class="foot"><button class="btn" type="button" data-close>Cancel</button><button class="btn danger" id="delYes">Remove</button></div>
+  </div>
+</div>
+
+<!-- Import seating modal -->
+<div class="overlay hidden" id="mImp">
+  <div class="modal" style="width:min(640px,100%)">
+    <h2 class="gold-text">Import seating</h2>
+    <div id="impBody" style="line-height:1.65"></div>
+    <div class="foot" style="margin-top:20px"><button class="btn" type="button" data-close>Cancel</button><button class="btn primary" id="impYes">Apply seating</button></div>
   </div>
 </div>
 
@@ -633,7 +649,7 @@ function listen(){
 const TITLES = ["Mr.", "Mrs.", "Ms.", "Dr.", "Prof.", "Ir.", "Dato'", "Datin", "Datuk", "Dato' Sri", "Datin Sri",
                 "Datuk Seri", "Tan Sri", "Puan Sri"];
 $('#titleList').innerHTML = TITLES.map(t => `<option value="${esc(t)}">`).join('');
-const isVip = t => !!t && !['mr', 'mrs', 'ms', 'miss', 'mdm', 'madam'].includes(String(t).toLowerCase().replace(/\./g, '').trim());
+const isVip = t => !!t && !['mr', 'mrs', 'ms', 'miss', 'mdm', 'madam', 'pn', 'puan', 'en', 'encik', 'cik', 'tuan'].includes(String(t).toLowerCase().replace(/\./g, '').trim());
 const fullName = (t, n) => (t ? t + ' ' : '') + (n || '');
 // 1 per attending guest (+1 for any old-style plus-one entered inside a single RSVP)
 const pax = r => r.attendance === 'Attending' ? 1 + (r.plus_one ? 1 : 0) : 0;
@@ -1354,6 +1370,103 @@ applyEvent();
 try { const t = localStorage.getItem('mot-admin-tab'); if (t && t !== 'list') setTab(t); } catch (e) {}
 
 /* ---------------- Export to Excel ---------------- */
+
+/* ---------- Import seating from Excel (the "By Table" sheet: Table | Guest | VIP | Branch) ---------- */
+let impPlan = null;
+const TITLE_RX = /^(tan sri|puan sri|dato'?\s*sri|datin sri|datuk seri|dato'?|datuk|datin|dr|prof|ir|mr|mrs|ms|miss|mdm|madam|pn|puan|encik|en|cik|tuan|hj|haji|hajah)\.?\s+/i;
+function splitTitle(raw){
+  let s = String(raw || '').replace(/[’`]/g, "'").replace(/\s+/g, ' ').trim(), t = '';
+  const m = s.match(TITLE_RX);
+  if (m && s.length > m[0].length) { t = m[0].trim(); s = s.slice(m[0].length).trim(); }
+  const fix = { 'mdm': 'Mdm.', 'mdm.': 'Mdm.', 'pn': 'Pn.', 'pn.': 'Pn.', 'mr': 'Mr.', 'mrs': 'Mrs.', 'ms': 'Ms.', 'dr': 'Dr.', 'en': 'En.', 'prof': 'Prof.', 'ir': 'Ir.' };
+  return { title: fix[t.toLowerCase()] || t, name: s };
+}
+const nameKey = raw => { let s = String(raw || '').toLowerCase().replace(/[’`]/g, "'"); let m; while ((m = s.trim().match(TITLE_RX)) && s.trim().length > m[0].length) s = s.trim().slice(m[0].length); return s.replace(/[^a-z0-9]/g, ''); };
+function findTable(cell){
+  const c = String(cell ?? '').trim(); if (!c || /^unassign|^no table|^-+$/i.test(c)) return null;
+  const n = norm(c), num = c.replace(/^table\s*/i, '').trim().toLowerCase();
+  return TABLES.find(t => norm(t.label) === n) || TABLES.find(t => String(t.short).toLowerCase() === num) || TABLES.find(t => String(t.id) === num) || undefined;
+}
+$('#importBtn').addEventListener('click', () => { if (!window.XLSX) return toast('Excel tool did not load. Check your internet and reload.', true); $('#importFile').value = ''; $('#importFile').click(); });
+$('#importFile').addEventListener('change', async e => {
+  const f = e.target.files[0]; if (!f) return;
+  try {
+    const wb = XLSX.read(await f.arrayBuffer(), { type: 'array' });
+    const names = [wb.SheetNames.find(n => /by\s*table/i.test(n)), ...wb.SheetNames].filter(Boolean);
+    let grid = null, hi = -1, col = {};
+    for (const sn of names) {
+      const g = XLSX.utils.sheet_to_json(wb.Sheets[sn], { header: 1, defval: '' });
+      for (let i = 0; i < Math.min(g.length, 15); i++) {
+        const hdr = g[i].map(x => String(x).trim().toLowerCase());
+        const ti = hdr.indexOf('table'), gi = hdr.findIndex(x => x === 'guest' || x === 'name' || x === 'full name' || x === 'guest name');
+        if (ti >= 0 && gi >= 0) { grid = g; hi = i; col = { t: ti, g: gi, b: hdr.indexOf('branch'), ti: hdr.indexOf('title') }; break; }
+      }
+      if (grid) break;
+    }
+    if (!grid) return toast('Could not find a sheet with "Table" and "Guest" columns.', true);
+    buildPlan(grid.slice(hi + 1), col, f.name);
+  } catch (err) { console.error(err); toast('Could not read that Excel file.', true); }
+});
+function buildPlan(lines, col, fileName){
+  const pool = rows.filter(r => !r.linkedTo || true);
+  const byKey = {}; pool.forEach(r => { [nameKey(r.name), nameKey(fullName(r.title, r.name))].forEach(k => { if (!k) return; (byKey[k] = byKey[k] || []); if (!byKey[k].includes(r)) byKey[k].push(r); }); });
+  const used = new Set(), seen = {}, seat = [], add = [], bad = [], dupes = [];
+  for (const L of lines) {
+    const raw = String(L[col.g] ?? '').trim(); if (!raw) continue;
+    const tcell = L[col.t], table = findTable(tcell);
+    if (table === undefined) { bad.push(`${raw} → "${tcell}"`); continue; }
+    const k = nameKey(col.ti >= 0 && L[col.ti] ? L[col.ti] + ' ' + raw : raw); if (!k) continue;
+    if (seen[k] !== undefined) { if (String(tcell ?? '').trim() && seen[k] !== (table && table.id)) dupes.push(raw); continue; }
+    seen[k] = table ? table.id : null;
+    const r = (byKey[k] || []).find(x => !used.has(x.id));
+    if (r) { used.add(r.id); seat.push({ r, table, raw }); }
+    else {
+      const st = col.ti >= 0 && L[col.ti] ? { title: String(L[col.ti]).trim(), name: raw } : splitTitle(raw);
+      const br = col.b >= 0 ? String(L[col.b] ?? '').trim() : '';
+      add.push({ ...st, branch: BRANCHES.includes(br) ? br : '', table, raw });
+    }
+  }
+  const off = rows.filter(r => !used.has(r.id));
+  impPlan = { seat, add, off };
+  const changes = seat.filter(x => (x.r.table || null) !== (x.table ? x.table.id : null) || x.r.attendance !== 'Attending').length;
+  const li = a => `<ul>${a.map(x => `<li>${x}</li>`).join('')}</ul>`;
+  $('#impBody').innerHTML = `
+    <p style="color:var(--muted)">File: <b style="color:var(--text)">${esc(fileName)}</b> · Event: <b style="color:var(--gold-hi)">${esc(EV.label)} · ${esc(EV.date)}</b></p>
+    <div class="imp-sec"><b class="n">${seat.length}</b>guests already on the list will get their table from the file <span style="color:var(--muted)">(${changes} change${changes === 1 ? '' : 's'})</span>
+      <details><summary>Show names</summary>${li(seat.map(x => `${esc(fullName(x.r.title, x.r.name))} → ${x.table ? esc(x.table.label) : 'No table'}${x.r.attendance !== 'Attending' ? ' <i>(will be marked Attending)</i>' : ''}`))}</details></div>
+    <div class="imp-sec"><b class="n">${add.length}</b>new guests will be added <span style="color:var(--muted)">(names in the file but not on the list yet)</span>
+      ${add.length ? `<details open><summary>Show names</summary>${li(add.map(x => `${esc(fullName(x.title, x.name))}${x.branch ? ' · ' + esc(x.branch) : ''} → ${x.table ? esc(x.table.label) : 'No table'}`))}</details>` : ''}</div>
+    <div class="imp-sec"><b class="n">${off.length}</b>guests on the list are <b>not in the file</b>. The file is the complete list, so they will be <b style="color:var(--no)">removed from the guest list</b>.
+      ${off.length ? `<label style="display:flex;gap:8px;align-items:center;margin-top:8px;cursor:pointer"><input type="checkbox" id="impOff" checked> Remove these ${off.length} (untick to keep them on the list with no table)</label>` : ''}
+      ${off.length ? `<details open><summary>Show names</summary>${li(off.map(r => esc(fullName(r.title, r.name)) + (r.table ? ` <span style="color:var(--muted)">(now ${esc(tableShort(r.table) ? 'Table ' + tableShort(r.table) : r.table)})</span>` : '')))}</details>` : ''}</div>
+    ${bad.length ? `<div class="imp-sec" style="border-color:var(--no)"><b style="color:var(--no)">Skipped (table not found):</b>${li(bad.map(esc))}</div>` : ''}
+    ${dupes.length ? `<p style="color:var(--muted);font-size:13px">Listed twice in the file (first table kept): ${dupes.map(esc).join(', ')}</p>` : ''}
+    <p style="color:var(--muted);font-size:13px;margin-top:10px">Nothing is saved until you press <b>Apply seating</b>. Check-in status is not changed.</p>`;
+  $('#mImp').classList.remove('hidden');
+}
+$('#impYes').addEventListener('click', async () => {
+  if (!impPlan) return;
+  const btn = $('#impYes'); btn.disabled = true;
+  try {
+    const ops = [];
+    impPlan.seat.forEach(({ r, table }) => { const t = table ? table.id : null;
+      if ((r.table || null) !== t || r.attendance !== 'Attending') ops.push(b => b.update(doc(db, 'rsvps', r.id), { table: t, attendance: 'Attending', ...stamp() })); });
+    const offNo = $('#impOff') && $('#impOff').checked;
+    impPlan.off.forEach(r => { if (offNo) ops.push(b => b.delete(doc(db, 'rsvps', r.id)));
+      else if (r.table) ops.push(b => b.update(doc(db, 'rsvps', r.id), { table: null, ...stamp() })); });
+    for (const [i, a] of impPlan.add.entries()) {
+      const id = await personId(EV.id + '|no-email-import-' + Date.now() + '-' + i, a.name);
+      ops.push(b => b.set(doc(db, 'rsvps', id), { title: a.title.slice(0, 30), name: a.name, phone: '', email: '', branch: a.branch, attendance: 'Attending',
+        ...(hasMeals() ? { main_course: '' } : {}), notes: '', checkedIn: false, table: a.table ? a.table.id : null, linkedTo: null,
+        event: EV.id, source: 'admin', addedBy: auth.currentUser.email, importedFrom: 'seating', createdAt: serverTimestamp(), ...stamp() }));
+    }
+    for (let i = 0; i < ops.length; i += 400) { const b = writeBatch(db); ops.slice(i, i + 400).forEach(f => f(b)); await b.commit(); }
+    $('#mImp').classList.add('hidden');
+    toast(`Seating imported · ${impPlan.seat.length} seated, ${impPlan.add.length} added${offNo ? `, ${impPlan.off.length} removed` : ''}`);
+    impPlan = null;
+  } catch (err) { console.error(err); toast('Could not save the seating: ' + (err.code || err.message), true); }
+  finally { btn.disabled = false; }
+});
 $('#exportBtn').addEventListener('click', () => {
   if (!window.XLSX) return toast('Excel export is still loading, try again in a second', true);
   // Grouped by party: each main guest followed by their plus-ones
